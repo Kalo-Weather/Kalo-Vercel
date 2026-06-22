@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "src": "/api/weather",
+      "dest": "/api/weather.js"
+    },
+    {
+      "src": "/api/config",
+      "dest": "/api/config.js"
+    }
+    ,
+    {
+      "src": "/analytics",
+      "dest": "/analytics/index.html"
+    }
+  ]
+}

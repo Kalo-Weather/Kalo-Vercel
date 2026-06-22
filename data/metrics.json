@@ -1,0 +1,9 @@
+{
+  "total_requests": 0,
+  "fallbacks": 0,
+  "provider_errors": 0,
+  "unauthorized": 0,
+  "bad_requests": 0,
+  "successes": 0,
+  "last_requests": []
+}

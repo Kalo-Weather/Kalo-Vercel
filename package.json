@@ -1,0 +1,8 @@
+{
+  "name": "kalo-vercel-proxy-sample",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node scripts/encrypt_and_call.js"
+  }
+}
