@@ -95,7 +95,7 @@ module.exports = async (req, res) => {
 
     if (!weatherApiKey) {
       recordMetric({ type: 'fallback', lat, lon, usedEncrypted, status: 200 });
-      return await handleOpenMeteoFallback(lat, lon, units, res);
+      return await handleMultiSourceFallback(lat, lon, units, res);
     }
 
     const weatherUrl = `https://api.openweathermap.org/data/2.5/onecall?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&exclude=minutely,alerts&units=${encodeURIComponent(units)}&appid=${encodeURIComponent(weatherApiKey)}`;
@@ -161,63 +161,201 @@ function decryptKey(encryptedString, hexKey) {
   }
 }
 
-async function handleOpenMeteoFallback(lat, lon, units, res) {
+const OPEN_METEO_URL = 'https://api.open-meteo.com/v1/forecast';
+const SEVEN_TIMER_URL = 'http://www.7timer.info/bin/api.pl';
+const AQ_API_URL = 'https://air-quality-api.open-meteo.com/v1/air-quality';
+
+async function fetchOpenMeteo(lat, lon, units) {
   const tempUnit = units === 'imperial' ? 'fahrenheit' : 'celsius';
   const windUnit = units === 'imperial' ? 'mph' : 'kmh';
 
-  const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&current_weather=true&hourly=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=${encodeURIComponent(tempUnit)}&wind_speed_unit=${encodeURIComponent(windUnit)}&timezone=auto`;
-  const response = await fetch(openMeteoUrl);
-  const data = await response.json();
+  const url = `${OPEN_METEO_URL}?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,uv_index&hourly=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=${encodeURIComponent(tempUnit)}&wind_speed_unit=${encodeURIComponent(windUnit)}&timezone=auto`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!res.ok) return null;
 
-  if (!response.ok) {
-    return res.status(502).json({ error: 'Failed to connect to fallback weather API.' });
-  }
+  const c = data.current || {};
+  return {
+    source: 'open-meteo',
+    current: {
+      temp: c.temperature_2m,
+      feels_like: c.apparent_temperature,
+      humidity: c.relative_humidity_2m,
+      weather_code: c.weather_code,
+      wind_speed: c.wind_speed_10m,
+      wind_direction: c.wind_direction_10m,
+      wind_gust: c.wind_gusts_10m,
+      uv_index: c.uv_index,
+    },
+    forecast: {
+      hourly: (data.hourly || {}).time ? data.hourly.time.slice(0, 24).map((t, i) => ({
+        time: Math.floor(new Date(t).getTime() / 1000),
+        temp: data.hourly.temperature_2m[i],
+        weather_code: data.hourly.weather_code[i]
+      })) : [],
+      daily: (data.daily || {}).time ? data.daily.time.slice(0, 7).map((t, i) => ({
+        time: Math.floor(new Date(t).getTime() / 1000),
+        min: data.daily.temperature_2m_min[i],
+        max: data.daily.temperature_2m_max[i],
+        weather_code: data.daily.weather_code[i]
+      })) : []
+    }
+  };
+}
 
-  const currentUv = data.hourly?.uv_index?.[0] ?? 0;
-  const currentHumidity = data.hourly?.relative_humidity_2m?.[0] ?? 0;
-  const currentWeather = data.current_weather || {};
+function directionToDeg(dir) {
+  const map = { 'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5, 'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5, 'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5, 'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5 };
+  return map[dir] ?? null;
+}
+
+async function fetch7Timer(lat, lon) {
+  const url = `${SEVEN_TIMER_URL}?lon=${encodeURIComponent(lon)}&lat=${encodeURIComponent(lat)}&product=civil&output=json`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!res.ok || !data.dataseries || data.dataseries.length === 0) return null;
+
+  const first = data.dataseries[0];
+  return {
+    source: '7timer',
+    current: {
+      temp: first.temp2m,
+      feels_like: first.temp2m,
+      humidity: parseFloat(first.rh2m),
+      weather_code: null,
+      wind_speed: first.wind10m?.speed || null,
+      wind_direction: first.wind10m ? directionToDeg(first.wind10m.direction) : null,
+      wind_gust: null,
+      uv_index: null,
+    },
+    forecast: null
+  };
+}
+
+async function fetchAirQuality(lat, lon) {
+  const url = `${AQ_API_URL}?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&current=european_aqi`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!res.ok || !data.current) return null;
+
+  const value = data.current.european_aqi || 0;
+  let level = 'Good';
+  let msg = 'Air quality is satisfactory.';
+  if (value > 50 && value <= 100) { level = 'Moderate'; msg = 'Air quality is acceptable.'; }
+  else if (value > 100 && value <= 150) { level = 'Unhealthy (Sensitive)'; msg = 'Sensitive groups should limit outdoor activity.'; }
+  else if (value > 150) { level = 'Unhealthy'; msg = 'Limit outdoor exposure.'; }
+
+  return { value, level, msg };
+}
+
+function averageSources(sources) {
+  if (!sources.length) return null;
+
+  const nums = (fn) => sources.map(s => fn(s)).filter(v => v != null);
+  const avg = (arr) => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null;
+
+  const temps = nums(s => s.current.temp);
+  const feels = nums(s => s.current.feels_like);
+  const humids = nums(s => s.current.humidity);
+  const speeds = nums(s => s.current.wind_speed);
+  const dirs = nums(s => s.current.wind_direction);
+  const gusts = nums(s => s.current.wind_gust);
+  const uvs = nums(s => s.current.uv_index);
+
+  const avgWindDir = (arr) => {
+    if (!arr.length) return 0;
+    const rad = arr.map(d => d * Math.PI / 180);
+    const sinSum = rad.reduce((a, r) => a + Math.sin(r), 0);
+    const cosSum = rad.reduce((a, r) => a + Math.cos(r), 0);
+    return (((Math.atan2(sinSum, cosSum) * 180 / Math.PI) % 360) + 360) % 360;
+  };
+
+  const conditions = sources.filter(s => s.current.weather_code != null).map(s => mapWMOToConditionString(s.current.weather_code));
+  const sourceConditions = sources.filter(s => s.current.weather_code == null && s.current.condition).map(s => s.current.condition);
+  const allConditions = [...conditions, ...sourceConditions];
+  const counts = {};
+  allConditions.forEach(c => counts[c] = (counts[c] || 0) + 1);
+  const topCondition = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Cloudy';
+
+  const illustrationMap = {
+    'Clear Sky': 'sun', 'Mainly Clear': 'cloud-sun', 'Cloudy': 'cloudy',
+    'Drizzle': 'rain', 'Rainy': 'rain', 'Snow Fall': 'snow', 'Thunderstorm': 'thunderstorm'
+  };
+
+  const avgTemp = avg(temps) || 0;
+  const avgHumid = avg(humids) || 0;
+
+  return {
+    current: {
+      temp: avgTemp,
+      feels_like: avg(feels) || avgTemp,
+      condition: topCondition,
+      illustration_code: illustrationMap[topCondition] || 'sun',
+    },
+    uv_index: uvs.length ? uvs.reduce((a, b) => a + b, 0) / uvs.length : 0,
+    wind: {
+      speed: avg(speeds) || 0,
+      deg: Math.round(avgWindDir(dirs)),
+      gust: avg(gusts) || avg(speeds) || 0
+    },
+    humidity: { value: avgHumid }
+  };
+}
+
+async function handleMultiSourceFallback(lat, lon, units, res) {
+  const [omResult, timerResult, aqiResult] = await Promise.allSettled([
+    fetchOpenMeteo(lat, lon, units),
+    fetch7Timer(lat, lon),
+    fetchAirQuality(lat, lon)
+  ]);
+
+  const sources = [];
+  if (omResult.status === 'fulfilled' && omResult.value) sources.push(omResult.value);
+  if (timerResult.status === 'fulfilled' && timerResult.value) sources.push(timerResult.value);
+
+  const aqi = (aqiResult.status === 'fulfilled' && aqiResult.value)
+    ? aqiResult.value
+    : { value: 35, level: 'Good', msg: 'Satisfactory air index' };
+
+  const avg = averageSources(sources);
+  const omForecast = (omResult.status === 'fulfilled' && omResult.value) ? omResult.value.forecast : null;
 
   return res.status(200).json({
     meta: {
       server_version: '1.2.0',
       client_compatibility_min: '1.0.0',
-      engine: 'Open-Meteo Keyless Fallback Engine'
+      engine: `Multi-Source Averaged Engine (${sources.length} sources)`
     },
     coordinates: { lat: parseFloat(lat), lon: parseFloat(lon) },
     current: {
-      temp: Math.round(currentWeather.temperature ?? 0),
-      feels_like: Math.round(currentWeather.temperature ?? 0),
-      condition: mapWMOToConditionString(currentWeather.weathercode),
-      illustration_code: mapWMOToIllustration(currentWeather.weathercode),
+      temp: avg.current.temp,
+      feels_like: avg.current.feels_like,
+      condition: avg.current.condition,
+      illustration_code: avg.current.illustration_code,
       timestamp: Math.floor(Date.now() / 1000)
     },
     uv: {
-      index: Math.round(currentUv),
-      level: currentUv <= 2 ? 'Low' : currentUv <= 5 ? 'Moderate' : 'High',
-      msg: currentUv <= 2 ? 'No protection required.' : 'Protection suggested.'
+      index: Math.round(avg.uv_index),
+      level: avg.uv_index <= 2 ? 'Low' : avg.uv_index <= 5 ? 'Moderate' : 'High',
+      msg: avg.uv_index <= 2 ? 'No protection required.' : 'Protection suggested.'
     },
-    aqi: { value: 35, level: 'Good', msg: 'Satisfactory air index' },
-    wind: {
-      speed: Math.round(currentWeather.windspeed ?? 0),
-      deg: currentWeather.winddirection ?? 0,
-      gust: Math.round(currentWeather.windgust ?? 0)
-    },
+    aqi,
+    wind: avg.wind,
     humidity: {
-      value: currentHumidity,
-      dew_point: Math.round((currentWeather.temperature ?? 0) - ((100 - currentHumidity) / 5)),
-      msg: currentHumidity > 60 ? 'Sticky' : 'Comfortable'
+      value: avg.humidity.value,
+      dew_point: Math.round(avg.current.temp - ((100 - avg.humidity.value) / 5)),
+      msg: avg.humidity.value > 60 ? 'Sticky' : 'Comfortable'
     },
     forecast: {
-      hourly: (data.hourly?.time ?? []).slice(0, 24).map((timeStr, idx) => ({
-        time: Math.floor(new Date(timeStr).getTime() / 1000),
-        temp: Math.round(data.hourly.temperature_2m?.[idx] ?? 0),
-        condition: mapWMOToConditionString(data.hourly.weather_code?.[idx])
+      hourly: (omForecast?.hourly || []).slice(0, 24).map(h => ({
+        time: h.time,
+        temp: Math.round(h.temp),
+        condition: mapWMOToConditionString(h.weather_code)
       })),
-      daily: (data.daily?.time ?? []).slice(0, 7).map((timeStr, idx) => ({
-        time: Math.floor(new Date(timeStr).getTime() / 1000),
-        min: Math.round(data.daily.temperature_2m_min?.[idx] ?? 0),
-        max: Math.round(data.daily.temperature_2m_max?.[idx] ?? 0),
-        condition: mapWMOToConditionString(data.daily.weather_code?.[idx])
+      daily: (omForecast?.daily || []).slice(0, 7).map(d => ({
+        time: d.time,
+        min: Math.round(d.min),
+        max: Math.round(d.max),
+        condition: mapWMOToConditionString(d.weather_code)
       }))
     }
   });

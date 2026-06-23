@@ -15,49 +15,30 @@ This repository contains the Vercel serverless backend for the Kalo Weather secu
 2. Install Vercel CLI if needed: `npm install -g vercel`.
 3. Run local dev server: `vercel dev`.
 
-## Test Endpoint
+## Client-Side Reference
+
+See [`clientside.md`](./clientside.md) for a complete client-side reference (endpoints, headers, response format, and examples in cURL, JavaScript, Python, and Dart).
+
+### Quick test (curl)
 
 ```bash
-curl -i -H "Authorization: Bearer CHANGE-ME" \
-     "http://localhost:3000/api/weather?lat=40.7128&lon=-74.0060"
+curl -s -H "Authorization: Bearer CHANGE-ME" \
+  -H "X-Client-Version: 1.2.0" \
+  "http://localhost:3000/api/weather?lat=40.7128&lon=-74.0060&units=metric" | jq .
 ```
 
-If no encrypted weather key is provided, the proxy routes requests to Open-Meteo keyless fallback.
-
-## Client sample (Node)
-
-This repository includes a small Node script that demonstrates encrypting provider keys
-and calling the local proxy with the encrypted headers.
-
-Usage:
-
-1. Ensure your local proxy is running (e.g. `vercel dev`).
-2. (Optional) Copy `.env.example` to `.env` and customize secrets.
-3. Run the sample:
+### Encryption test (Node)
 
 ```bash
 node scripts/encrypt_and_call.js
 ```
 
-The script sends two requests:
-- a fallback request with no encrypted headers
-- a request with `X-Encrypted-Weather-Key` and `X-Encrypted-Aqi-Key` headers
+Sends two requests: one fallback (no encrypted keys) and one with encrypted `X-Encrypted-Weather-Key` / `X-Encrypted-Aqi-Key` headers.
 
-You can adjust `DECRYPTION_SECRET_KEY` and `KALO_CLIENT_APP_SECRET` via environment variables.
+### Available endpoints
 
-## Flutter / Dart encryption snippet
-
-If your client is Flutter, you can use the `cryptography` package to encrypt provider keys
-before sending them in the `X-Encrypted-*` headers. A sample helper is included at
-`scripts/flutter_encrypt.dart`.
-
-Example (Dart):
-
-```dart
-// Use package:cryptography (add to pubspec.yaml)
-// final encrypted = await encryptKey('YOUR_OPENWEATHER_KEY', '<32-byte-hex-secret>');
-// send as header: 'X-Encrypted-Weather-Key': encrypted
-```
-
-Note: I couldn't run the Dart snippet in this environment; run the example inside your
-Flutter project or a local Dart environment.
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/weather?lat=&lon=&units=` | Weather + AQI proxy (multi-source averaged fallback) |
+| `GET /api/config` | App version + feature flags |
+| `GET /api/metrics` | Usage stats
