@@ -2,7 +2,7 @@
 // Run with: node samples/fetch.js (Node 18+)
 
 const PROXY = process.env.KALO_PROXY_HOST || 'http://localhost:3000';
-const SECRET = process.env.KALO_CLIENT_APP_SECRET || 'CHANGE-ME';
+const SECRET = process.env.KALO_CLIENT_APP_SECRET || 'change-me';
 
 async function getWeather(lat, lon, units = 'metric', encryptedKeys = {}) {
   const params = new URLSearchParams({ lat, lon, units });

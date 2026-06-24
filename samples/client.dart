@@ -17,7 +17,7 @@ class KaloWeatherClient {
 
   KaloWeatherClient({
     this.baseUrl = 'http://localhost:3000',
-    this.clientSecret = 'CHANGE-ME',
+    this.clientSecret = 'change-me',
     this.decryptionSecret,
   });
 
@@ -104,7 +104,7 @@ void main() async {
 
   // 2. With encrypted keys (uncomment after setting decryptionSecret)
   // final client2 = KaloWeatherClient(
-  //   decryptionSecret: 'CHANGE-ME',
+  //   decryptionSecret: 'change-me-32-bytes-hex-secret-key',
   // );
   // final premium = await client2.getWeather(
   //   lat: 48.8566, lon: 2.3522,

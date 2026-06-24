@@ -40,7 +40,7 @@ Future<String> encryptKey(String plainText, String hexKey) async {
 // Example usage (run within a Dart/Flutter environment):
 //
 // void main() async {
-//   final decryptionSecret = 'CHANGE-ME';
+//   final decryptionSecret = 'change-me-32-bytes-hex-secret-key';
 //   final providerKey = 'YOUR_OPENWEATHER_KEY';
 //   final encrypted = await encryptKey(providerKey, decryptionSecret);
 //   print('X-Encrypted-Weather-Key: $encrypted');

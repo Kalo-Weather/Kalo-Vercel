@@ -22,7 +22,7 @@ See [`clientside.md`](./clientside.md) for a complete client-side reference (end
 ### Quick test (curl)
 
 ```bash
-curl -s -H "Authorization: Bearer CHANGE-ME" \
+curl -s -H "Authorization: Bearer $KALO_CLIENT_APP_SECRET" \
   -H "X-Client-Version: 1.2.0" \
   "http://localhost:3000/api/weather?lat=40.7128&lon=-74.0060&units=metric" | jq .
 ```

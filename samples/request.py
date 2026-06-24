@@ -5,7 +5,7 @@ import os
 import requests
 
 PROXY = os.getenv('KALO_PROXY_HOST', 'http://localhost:3000')
-SECRET = os.getenv('KALO_CLIENT_APP_SECRET', 'CHANGE-ME')
+SECRET = os.getenv('KALO_CLIENT_APP_SECRET', 'change-me')
 HEADERS = {'Authorization': f'Bearer {SECRET}', 'X-Client-Version': '1.2.0'}
 
 

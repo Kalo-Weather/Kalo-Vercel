@@ -3,7 +3,7 @@
 # Usage: bash samples/curl.sh
 
 PROXY="http://localhost:3000"
-SECRET="CHANGE-ME"
+SECRET="${KALO_CLIENT_APP_SECRET:-change-me}"
 
 echo "=== 1. Fallback request (no encrypted keys) ==="
 curl -s "$PROXY/api/weather?lat=40.7128&lon=-74.0060&units=metric" \

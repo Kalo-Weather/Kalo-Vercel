@@ -22,6 +22,10 @@
     <h3>Recent Requests</h3>
     <div id="recent"></div>
   </div>
+  <div class="card">
+    <h3>Cached Locations (ML Popularity Score)</h3>
+    <div id="cached"><em>No cached locations yet</em></div>
+  </div>
   <script>
     async function fetchMetrics() {
       try {
@@ -32,6 +36,12 @@
           <div class="stat"><strong>Fallbacks</strong><div>${json.fallbacks||0}</div></div>
           <div class="stat"><strong>Provider Errors</strong><div>${json.provider_errors||0}</div></div>
           <div class="stat"><strong>Successes</strong><div>${json.successes||0}</div></div>
+          <div class="stat"><strong>Cache Hits</strong><div>${json.cache?.cache_hits||0}</div></div>
+          <div class="stat"><strong>Cache Misses</strong><div>${json.cache?.cache_misses||0}</div></div>
+          <div class="stat"><strong>Cache Rate</strong><div>${(()=>{const t=(json.cache?.cache_hits||0)+(json.cache?.cache_misses||0);return t?Math.round(json.cache?.cache_hits/t*100)+'%':'0%'})()}</div></div>
+          <div class="stat"><strong>Locations Tracked</strong><div>${json.cache?.location_count||0}</div></div>
+          <div class="stat"><strong>Responses Cached</strong><div>${json.cache?.responses_cached||0}</div></div>
+          <div class="stat"><strong>Evictions</strong><div>${json.cache?.locations_evicted||0}</div></div>
         `;
 
         const recent = (json.last_requests||[]).slice(0,20).map(r => {
@@ -39,6 +49,19 @@
           return `<div style="margin-bottom:8px"><strong>${r.type}</strong> @ ${t} &middot; lat:${r.lat||'-'} lon:${r.lon||'-'} enc:${r.usedEncrypted} status:${r.status||'-'}</div>`;
         }).join('');
         document.getElementById('recent').innerHTML = recent || '<em>No recent requests</em>';
+
+        const cached = (json.cache?.cached_locations||[]).slice(0,10);
+        if (cached.length) {
+          document.getElementById('cached').innerHTML = cached.map(c => `
+            <div style="margin-bottom:6px;font-size:14px">
+              <strong>${c.key}</strong> &middot;
+              score:${c.score} &middot;
+              requests:${c.count} &middot;
+              hits:${c.hits} &middot;
+              cached ${c.cached_seconds_ago}s ago
+            </div>
+          `).join('');
+        }
       } catch (e) {
         document.getElementById('stats').textContent = 'Error loading metrics';
       }

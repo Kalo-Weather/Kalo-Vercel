@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const cache = require('./cache');
 
 const METRICS_FILE = path.join(__dirname, '..', 'data', 'metrics.json');
 
@@ -64,7 +65,7 @@ module.exports = async (req, res) => {
     const clientVersion = req.headers['x-client-version'] || '1.0.0';
 
     const authHeader = req.headers.authorization;
-    const clientAppSecret = process.env.KALO_CLIENT_APP_SECRET || 'CHANGE-ME';
+    const clientAppSecret = process.env.KALO_CLIENT_APP_SECRET;
     if (!authHeader || authHeader !== `Bearer ${clientAppSecret}`) {
       recordMetric({ type: 'unauthorized', status: 401 });
       return res.status(401).json({
@@ -77,6 +78,15 @@ module.exports = async (req, res) => {
     if (!lat || !lon) {
       recordMetric({ type: 'bad_request', status: 400 });
       return res.status(400).json({ error: 'Missing lat/lon parameters' });
+    }
+
+    cache.evictStaleCache();
+    cache.recordLocationAccess(lat, lon);
+    const cached = cache.getCachedResponse(lat, lon);
+    if (cached) {
+      cached.meta.cache = 'hit';
+      recordMetric({ type: 'success', lat, lon, usedEncrypted: false, status: 200 });
+      return res.status(200).json(cached);
     }
 
     const decryptionSecret = process.env.DECRYPTION_SECRET_KEY;
@@ -119,7 +129,8 @@ module.exports = async (req, res) => {
         server_version: '1.2.0',
         client_compatibility_min: '1.0.0',
         engine: 'Kalo Decrypted Proxy Platform',
-        client_version: clientVersion
+        client_version: clientVersion,
+        cache: 'miss'
       },
       coordinates: { lat: parseFloat(lat), lon: parseFloat(lon) },
       current: parseCurrentWeather(weatherResponse),
@@ -131,6 +142,7 @@ module.exports = async (req, res) => {
     };
 
     recordMetric({ type: 'success', lat, lon, usedEncrypted, status: 200 });
+    cache.setCachedResponse(lat, lon, normalizedPayload);
     return res.status(200).json(normalizedPayload);
   } catch (error) {
     console.error('Proxy Processing Error:', error);
@@ -319,11 +331,12 @@ async function handleMultiSourceFallback(lat, lon, units, res) {
   const avg = averageSources(sources);
   const omForecast = (omResult.status === 'fulfilled' && omResult.value) ? omResult.value.forecast : null;
 
-  return res.status(200).json({
+  const fallbackPayload = {
     meta: {
       server_version: '1.2.0',
       client_compatibility_min: '1.0.0',
-      engine: `Multi-Source Averaged Engine (${sources.length} sources)`
+      engine: `Multi-Source Averaged Engine (${sources.length} sources)`,
+      cache: 'miss'
     },
     coordinates: { lat: parseFloat(lat), lon: parseFloat(lon) },
     current: {
@@ -358,7 +371,10 @@ async function handleMultiSourceFallback(lat, lon, units, res) {
         condition: mapWMOToConditionString(d.weather_code)
       }))
     }
-  });
+  };
+
+  cache.setCachedResponse(lat, lon, fallbackPayload);
+  return res.status(200).json(fallbackPayload);
 }
 
 function parseCurrentWeather(data) {

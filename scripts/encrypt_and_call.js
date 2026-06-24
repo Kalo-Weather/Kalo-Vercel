@@ -1,8 +1,8 @@
 const crypto = require('crypto');
 const http = require('http');
 
-const DECRYPTION_SECRET = process.env.DECRYPTION_SECRET_KEY || 'CHANGE-ME';
-const CLIENT_SECRET = process.env.KALO_CLIENT_APP_SECRET || 'CHANGE-ME';
+const DECRYPTION_SECRET = process.env.DECRYPTION_SECRET_KEY || 'change-me-32-bytes-hex-secret-key';
+const CLIENT_SECRET = process.env.KALO_CLIENT_APP_SECRET || 'change-me';
 const HOST = process.env.KALO_PROXY_HOST || 'localhost';
 const PORT = process.env.KALO_PROXY_PORT || 3000;
 const PATH = `/api/weather?lat=40.7128&lon=-74.0060&units=metric`;

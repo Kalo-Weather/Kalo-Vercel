@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const cache = require('./cache');
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -7,11 +8,12 @@ module.exports = async (req, res) => {
 
   const METRICS_FILE = path.join(__dirname, '..', 'data', 'metrics.json');
   try {
-    if (!fs.existsSync(METRICS_FILE)) {
-      return res.status(200).json({ total_requests: 0, fallbacks: 0, provider_errors: 0, successes: 0, last_requests: [] });
+    let metrics = { total_requests: 0, fallbacks: 0, provider_errors: 0, successes: 0, last_requests: [] };
+    if (fs.existsSync(METRICS_FILE)) {
+      const raw = fs.readFileSync(METRICS_FILE, 'utf8') || '{}';
+      metrics = JSON.parse(raw);
     }
-    const raw = fs.readFileSync(METRICS_FILE, 'utf8') || '{}';
-    const metrics = JSON.parse(raw);
+    metrics.cache = cache.getCacheStats();
     return res.status(200).json(metrics);
   } catch (e) {
     console.error('Metrics read error', e);
