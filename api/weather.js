@@ -1,47 +1,35 @@
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const { Redis } = require('@upstash/redis');
 const cache = require('./cache');
+const pubsub = require('./pubsub');
 
-const METRICS_FILE = path.join(__dirname, '..', 'data', 'metrics.json');
+let redis = null;
+try {
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    redis = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+  }
+} catch (e) {
+  console.error('Weather Redis init error:', e.message);
+}
 
-function recordMetric(event) {
+async function recordMetric(event) {
+  if (!redis) return;
   try {
-    let metrics = {
-      total_requests: 0,
-      fallbacks: 0,
-      provider_errors: 0,
-      unauthorized: 0,
-      bad_requests: 0,
-      successes: 0,
-      last_requests: []
-    };
-
-    if (fs.existsSync(METRICS_FILE)) {
-      const raw = fs.readFileSync(METRICS_FILE, 'utf8') || '{}';
-      try { metrics = Object.assign(metrics, JSON.parse(raw)); } catch(e) { /* ignore */ }
-    }
-
-    metrics.total_requests = (metrics.total_requests || 0) + 1;
-    if (event.type === 'fallback') metrics.fallbacks = (metrics.fallbacks || 0) + 1;
-    if (event.type === 'provider_error') metrics.provider_errors = (metrics.provider_errors || 0) + 1;
-    if (event.type === 'unauthorized') metrics.unauthorized = (metrics.unauthorized || 0) + 1;
-    if (event.type === 'bad_request') metrics.bad_requests = (metrics.bad_requests || 0) + 1;
-    if (event.type === 'success') metrics.successes = (metrics.successes || 0) + 1;
-
-    metrics.last_requests = metrics.last_requests || [];
-    metrics.last_requests.unshift({
+    await redis.hincrby('metrics:counts', 'total_requests', 1);
+    if (event.type) await redis.hincrby('metrics:counts', event.type, 1);
+    const entry = {
       time: Date.now(),
       type: event.type,
       lat: event.lat || null,
       lon: event.lon || null,
       usedEncrypted: !!event.usedEncrypted,
-      status: event.status || null
-    });
-    if (metrics.last_requests.length > 50) metrics.last_requests.pop();
-
-    fs.mkdirSync(path.dirname(METRICS_FILE), { recursive: true });
-    fs.writeFileSync(METRICS_FILE, JSON.stringify(metrics, null, 2), 'utf8');
+      status: event.status || null,
+    };
+    await redis.lpush('metrics:requests', JSON.stringify(entry));
+    await redis.ltrim('metrics:requests', 0, 49);
   } catch (e) {
     console.error('Metric write error', e);
   }
@@ -67,25 +55,28 @@ module.exports = async (req, res) => {
     const authHeader = req.headers.authorization;
     const clientAppSecret = process.env.KALO_CLIENT_APP_SECRET;
     if (!authHeader || authHeader !== `Bearer ${clientAppSecret}`) {
-      recordMetric({ type: 'unauthorized', status: 401 });
+      await recordMetric({ type: 'unauthorized', status: 401 });
+      pubsub.publish('auth:unauthorized', { clientVersion });
       return res.status(401).json({
         error: 'Unauthorized',
-        message: 'Verify client-side KALO_CLIENT_APP_SECRET.'
+        message: 'Verify client-side KALO_CLIENT_APP_SECRET.',
       });
     }
 
     const { lat, lon, units = 'metric' } = req.query;
     if (!lat || !lon) {
-      recordMetric({ type: 'bad_request', status: 400 });
+      await recordMetric({ type: 'bad_request', status: 400 });
+      pubsub.publish('request:bad', { lat, lon, clientVersion });
       return res.status(400).json({ error: 'Missing lat/lon parameters' });
     }
 
-    cache.evictStaleCache();
-    cache.recordLocationAccess(lat, lon);
-    const cached = cache.getCachedResponse(lat, lon);
+    await cache.evictStaleCache();
+    await cache.recordLocationAccess(lat, lon);
+    const cached = await cache.getCachedResponse(lat, lon);
     if (cached) {
       cached.meta.cache = 'hit';
-      recordMetric({ type: 'success', lat, lon, usedEncrypted: false, status: 200 });
+      await recordMetric({ type: 'success', lat, lon, usedEncrypted: false, status: 200 });
+      pubsub.publish('cache:hit', { lat, lon, clientVersion });
       return res.status(200).json(cached);
     }
 
@@ -104,7 +95,8 @@ module.exports = async (req, res) => {
     }
 
     if (!weatherApiKey) {
-      recordMetric({ type: 'fallback', lat, lon, usedEncrypted, status: 200 });
+      await recordMetric({ type: 'fallback', lat, lon, usedEncrypted, status: 200 });
+      pubsub.publish('weather:fallback', { lat, lon, units, clientVersion });
       return await handleMultiSourceFallback(lat, lon, units, res);
     }
 
@@ -112,15 +104,16 @@ module.exports = async (req, res) => {
     const aqiUrl = `https://api.waqi.info/feed/geo:${encodeURIComponent(lat)};${encodeURIComponent(lon)}/?token=${encodeURIComponent(waqiApiKey || 'demo')}`;
 
     const [weatherResponse, aqiResponse] = await Promise.all([
-      fetch(weatherUrl).then(r => r.json()),
-      fetch(aqiUrl).then(r => r.json())
+      fetch(weatherUrl).then((r) => r.json()),
+      fetch(aqiUrl).then((r) => r.json()),
     ]);
 
     if (weatherResponse.cod && weatherResponse.cod !== 200) {
-      recordMetric({ type: 'provider_error', lat, lon, usedEncrypted, status: 400 });
+      await recordMetric({ type: 'provider_error', lat, lon, usedEncrypted, status: 400 });
+      pubsub.publish('provider:error', { lat, lon, message: weatherResponse.message });
       return res.status(400).json({
         error: 'Provider rejected key',
-        message: weatherResponse.message || 'Invalid or expired API Key.'
+        message: weatherResponse.message || 'Invalid or expired API Key.',
       });
     }
 
@@ -130,7 +123,7 @@ module.exports = async (req, res) => {
         client_compatibility_min: '1.0.0',
         engine: 'Kalo Decrypted Proxy Platform',
         client_version: clientVersion,
-        cache: 'miss'
+        cache: 'miss',
       },
       coordinates: { lat: parseFloat(lat), lon: parseFloat(lon) },
       current: parseCurrentWeather(weatherResponse),
@@ -138,15 +131,17 @@ module.exports = async (req, res) => {
       aqi: parseAQI(aqiResponse),
       wind: parseWind(weatherResponse),
       humidity: parseHumidity(weatherResponse),
-      forecast: parseForecasts(weatherResponse)
+      forecast: parseForecasts(weatherResponse),
     };
 
-    recordMetric({ type: 'success', lat, lon, usedEncrypted, status: 200 });
-    cache.setCachedResponse(lat, lon, normalizedPayload);
+    await recordMetric({ type: 'success', lat, lon, usedEncrypted, status: 200 });
+    await cache.setCachedResponse(lat, lon, normalizedPayload);
+    pubsub.publish('weather:fetched', { lat, lon, units, clientVersion, source: 'premium' });
     return res.status(200).json(normalizedPayload);
   } catch (error) {
     console.error('Proxy Processing Error:', error);
-    recordMetric({ type: 'error', status: 500 });
+    await recordMetric({ type: 'error', status: 500 });
+    pubsub.publish('system:error', { message: error.message });
     return res.status(500).json({ error: 'Processing Error', details: error.message });
   }
 };
@@ -200,23 +195,27 @@ async function fetchOpenMeteo(lat, lon, units) {
       uv_index: c.uv_index,
     },
     forecast: {
-      hourly: (data.hourly || {}).time ? data.hourly.time.slice(0, 24).map((t, i) => ({
-        time: Math.floor(new Date(t).getTime() / 1000),
-        temp: data.hourly.temperature_2m[i],
-        weather_code: data.hourly.weather_code[i]
-      })) : [],
-      daily: (data.daily || {}).time ? data.daily.time.slice(0, 7).map((t, i) => ({
-        time: Math.floor(new Date(t).getTime() / 1000),
-        min: data.daily.temperature_2m_min[i],
-        max: data.daily.temperature_2m_max[i],
-        weather_code: data.daily.weather_code[i]
-      })) : []
-    }
+      hourly: (data.hourly || {}).time
+        ? data.hourly.time.slice(0, 24).map((t, i) => ({
+            time: Math.floor(new Date(t).getTime() / 1000),
+            temp: data.hourly.temperature_2m[i],
+            weather_code: data.hourly.weather_code[i],
+          }))
+        : [],
+      daily: (data.daily || {}).time
+        ? data.daily.time.slice(0, 7).map((t, i) => ({
+            time: Math.floor(new Date(t).getTime() / 1000),
+            min: data.daily.temperature_2m_min[i],
+            max: data.daily.temperature_2m_max[i],
+            weather_code: data.daily.weather_code[i],
+          }))
+        : [],
+    },
   };
 }
 
 function directionToDeg(dir) {
-  const map = { 'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5, 'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5, 'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5, 'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5 };
+  const map = { N: 0, NNE: 22.5, NE: 45, ENE: 67.5, E: 90, ESE: 112.5, SE: 135, SSE: 157.5, S: 180, SSW: 202.5, SW: 225, WSW: 247.5, W: 270, WNW: 292.5, NW: 315, NNW: 337.5 };
   return map[dir] ?? null;
 }
 
@@ -239,7 +238,7 @@ async function fetch7Timer(lat, lon) {
       wind_gust: null,
       uv_index: null,
     },
-    forecast: null
+    forecast: null,
   };
 }
 
@@ -252,9 +251,7 @@ async function fetchAirQuality(lat, lon) {
   const value = data.current.european_aqi || 0;
   let level = 'Good';
   let msg = 'Air quality is satisfactory.';
-  if (value > 50 && value <= 100) { level = 'Moderate'; msg = 'Air quality is acceptable.'; }
-  else if (value > 100 && value <= 150) { level = 'Unhealthy (Sensitive)'; msg = 'Sensitive groups should limit outdoor activity.'; }
-  else if (value > 150) { level = 'Unhealthy'; msg = 'Limit outdoor exposure.'; }
+  if (value > 50 && value <= 100) { level = 'Moderate'; msg = 'Air quality is acceptable.'; } else if (value > 100 && value <= 150) { level = 'Unhealthy (Sensitive)'; msg = 'Sensitive groups should limit outdoor activity.'; } else if (value > 150) { level = 'Unhealthy'; msg = 'Limit outdoor exposure.'; }
 
   return { value, level, msg };
 }
@@ -262,35 +259,35 @@ async function fetchAirQuality(lat, lon) {
 function averageSources(sources) {
   if (!sources.length) return null;
 
-  const nums = (fn) => sources.map(s => fn(s)).filter(v => v != null);
-  const avg = (arr) => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null;
+  const nums = (fn) => sources.map((s) => fn(s)).filter((v) => v != null);
+  const avg = (arr) => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null);
 
-  const temps = nums(s => s.current.temp);
-  const feels = nums(s => s.current.feels_like);
-  const humids = nums(s => s.current.humidity);
-  const speeds = nums(s => s.current.wind_speed);
-  const dirs = nums(s => s.current.wind_direction);
-  const gusts = nums(s => s.current.wind_gust);
-  const uvs = nums(s => s.current.uv_index);
+  const temps = nums((s) => s.current.temp);
+  const feels = nums((s) => s.current.feels_like);
+  const humids = nums((s) => s.current.humidity);
+  const speeds = nums((s) => s.current.wind_speed);
+  const dirs = nums((s) => s.current.wind_direction);
+  const gusts = nums((s) => s.current.wind_gust);
+  const uvs = nums((s) => s.current.uv_index);
 
   const avgWindDir = (arr) => {
     if (!arr.length) return 0;
-    const rad = arr.map(d => d * Math.PI / 180);
+    const rad = arr.map((d) => (d * Math.PI) / 180);
     const sinSum = rad.reduce((a, r) => a + Math.sin(r), 0);
     const cosSum = rad.reduce((a, r) => a + Math.cos(r), 0);
-    return (((Math.atan2(sinSum, cosSum) * 180 / Math.PI) % 360) + 360) % 360;
+    return (((Math.atan2(sinSum, cosSum) * 180) / Math.PI) % 360 + 360) % 360;
   };
 
-  const conditions = sources.filter(s => s.current.weather_code != null).map(s => mapWMOToConditionString(s.current.weather_code));
-  const sourceConditions = sources.filter(s => s.current.weather_code == null && s.current.condition).map(s => s.current.condition);
+  const conditions = sources.filter((s) => s.current.weather_code != null).map((s) => mapWMOToConditionString(s.current.weather_code));
+  const sourceConditions = sources.filter((s) => s.current.weather_code == null && s.current.condition).map((s) => s.current.condition);
   const allConditions = [...conditions, ...sourceConditions];
   const counts = {};
-  allConditions.forEach(c => counts[c] = (counts[c] || 0) + 1);
+  allConditions.forEach((c) => (counts[c] = (counts[c] || 0) + 1));
   const topCondition = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Cloudy';
 
   const illustrationMap = {
-    'Clear Sky': 'sun', 'Mainly Clear': 'cloud-sun', 'Cloudy': 'cloudy',
-    'Drizzle': 'rain', 'Rainy': 'rain', 'Snow Fall': 'snow', 'Thunderstorm': 'thunderstorm'
+    'Clear Sky': 'sun', 'Mainly Clear': 'cloud-sun', Cloudy: 'cloudy',
+    Drizzle: 'rain', Rainy: 'rain', 'Snow Fall': 'snow', Thunderstorm: 'thunderstorm',
   };
 
   const avgTemp = avg(temps) || 0;
@@ -307,9 +304,9 @@ function averageSources(sources) {
     wind: {
       speed: avg(speeds) || 0,
       deg: Math.round(avgWindDir(dirs)),
-      gust: avg(gusts) || avg(speeds) || 0
+      gust: avg(gusts) || avg(speeds) || 0,
     },
-    humidity: { value: avgHumid }
+    humidity: { value: avgHumid },
   };
 }
 
@@ -317,26 +314,26 @@ async function handleMultiSourceFallback(lat, lon, units, res) {
   const [omResult, timerResult, aqiResult] = await Promise.allSettled([
     fetchOpenMeteo(lat, lon, units),
     fetch7Timer(lat, lon),
-    fetchAirQuality(lat, lon)
+    fetchAirQuality(lat, lon),
   ]);
 
   const sources = [];
   if (omResult.status === 'fulfilled' && omResult.value) sources.push(omResult.value);
   if (timerResult.status === 'fulfilled' && timerResult.value) sources.push(timerResult.value);
 
-  const aqi = (aqiResult.status === 'fulfilled' && aqiResult.value)
+  const aqi = aqiResult.status === 'fulfilled' && aqiResult.value
     ? aqiResult.value
     : { value: 35, level: 'Good', msg: 'Satisfactory air index' };
 
   const avg = averageSources(sources);
-  const omForecast = (omResult.status === 'fulfilled' && omResult.value) ? omResult.value.forecast : null;
+  const omForecast = omResult.status === 'fulfilled' && omResult.value ? omResult.value.forecast : null;
 
   const fallbackPayload = {
     meta: {
       server_version: '1.2.0',
       client_compatibility_min: '1.0.0',
       engine: `Multi-Source Averaged Engine (${sources.length} sources)`,
-      cache: 'miss'
+      cache: 'miss',
     },
     coordinates: { lat: parseFloat(lat), lon: parseFloat(lon) },
     current: {
@@ -344,36 +341,37 @@ async function handleMultiSourceFallback(lat, lon, units, res) {
       feels_like: avg.current.feels_like,
       condition: avg.current.condition,
       illustration_code: avg.current.illustration_code,
-      timestamp: Math.floor(Date.now() / 1000)
+      timestamp: Math.floor(Date.now() / 1000),
     },
     uv: {
       index: Math.round(avg.uv_index),
       level: avg.uv_index <= 2 ? 'Low' : avg.uv_index <= 5 ? 'Moderate' : 'High',
-      msg: avg.uv_index <= 2 ? 'No protection required.' : 'Protection suggested.'
+      msg: avg.uv_index <= 2 ? 'No protection required.' : 'Protection suggested.',
     },
     aqi,
     wind: avg.wind,
     humidity: {
       value: avg.humidity.value,
-      dew_point: Math.round(avg.current.temp - ((100 - avg.humidity.value) / 5)),
-      msg: avg.humidity.value > 60 ? 'Sticky' : 'Comfortable'
+      dew_point: Math.round(avg.current.temp - (100 - avg.humidity.value) / 5),
+      msg: avg.humidity.value > 60 ? 'Sticky' : 'Comfortable',
     },
     forecast: {
-      hourly: (omForecast?.hourly || []).slice(0, 24).map(h => ({
+      hourly: (omForecast?.hourly || []).slice(0, 24).map((h) => ({
         time: h.time,
         temp: Math.round(h.temp),
-        condition: mapWMOToConditionString(h.weather_code)
+        condition: mapWMOToConditionString(h.weather_code),
       })),
-      daily: (omForecast?.daily || []).slice(0, 7).map(d => ({
+      daily: (omForecast?.daily || []).slice(0, 7).map((d) => ({
         time: d.time,
         min: Math.round(d.min),
         max: Math.round(d.max),
-        condition: mapWMOToConditionString(d.weather_code)
-      }))
-    }
+        condition: mapWMOToConditionString(d.weather_code),
+      })),
+    },
   };
 
-  cache.setCachedResponse(lat, lon, fallbackPayload);
+  await cache.setCachedResponse(lat, lon, fallbackPayload);
+  pubsub.publish('weather:fetched', { lat, lon, units, source: 'fallback' });
   return res.status(200).json(fallbackPayload);
 }
 
@@ -384,7 +382,7 @@ function parseCurrentWeather(data) {
     condition: data.current?.weather?.[0]?.main ?? 'Unknown',
     condition_desc: data.current?.weather?.[0]?.description ?? '',
     illustration_code: mapConditionToIllustration(data.current?.weather?.[0]?.id, data.current?.weather?.[0]?.icon),
-    timestamp: data.current?.dt ?? Math.floor(Date.now() / 1000)
+    timestamp: data.current?.dt ?? Math.floor(Date.now() / 1000),
   };
 }
 
@@ -393,9 +391,7 @@ function parseUV(data) {
   let level = 'Low';
   let msg = 'Safe to spend time outdoors.';
 
-  if (index > 2 && index <= 5) { level = 'Moderate'; msg = 'Apply sunscreen. Seek shade.'; }
-  else if (index > 5 && index <= 7) { level = 'High'; msg = 'Wear a hat, sunglasses, and SPF.'; }
-  else if (index > 7) { level = 'Very High'; msg = 'Minimize direct mid-day sun exposure.'; }
+  if (index > 2 && index <= 5) { level = 'Moderate'; msg = 'Apply sunscreen. Seek shade.'; } else if (index > 5 && index <= 7) { level = 'High'; msg = 'Wear a hat, sunglasses, and SPF.'; } else if (index > 7) { level = 'Very High'; msg = 'Minimize direct mid-day sun exposure.'; }
 
   return { index, level, msg };
 }
@@ -410,7 +406,7 @@ function parseAQI(data) {
   return {
     value,
     level,
-    msg: data.data?.dominentpol ? `Dominant pollutant: ${data.data.dominentpol.toUpperCase()}` : 'Air quality is satisfactory.'
+    msg: data.data?.dominentpol ? `Dominant pollutant: ${data.data.dominentpol.toUpperCase()}` : 'Air quality is satisfactory.',
   };
 }
 
@@ -418,7 +414,7 @@ function parseWind(data) {
   return {
     speed: Math.round(data.current?.wind_speed ?? 0),
     deg: data.current?.wind_deg ?? 0,
-    gust: Math.round(data.current?.wind_gust ?? 0)
+    gust: Math.round(data.current?.wind_gust ?? 0),
   };
 }
 
@@ -427,24 +423,24 @@ function parseHumidity(data) {
   return {
     value,
     dew_point: Math.round(data.current?.dew_point ?? 0),
-    msg: value > 60 ? 'Sticky / Humid' : 'Comfortable'
+    msg: value > 60 ? 'Sticky / Humid' : 'Comfortable',
   };
 }
 
 function parseForecasts(data) {
   return {
-    hourly: (data.hourly?.hourly ?? data.hourly ?? []).slice(0, 24).map(h => ({
+    hourly: (data.hourly?.hourly ?? data.hourly ?? []).slice(0, 24).map((h) => ({
       time: h.dt,
       temp: Math.round(h.temp),
-      icon: h.weather?.[0]?.icon
+      icon: h.weather?.[0]?.icon,
     })),
-    daily: (data.daily ?? []).slice(0, 7).map(d => ({
+    daily: (data.daily ?? []).slice(0, 7).map((d) => ({
       time: d.dt,
       min: Math.round(d.temp?.min),
       max: Math.round(d.temp?.max),
       condition: d.weather?.[0]?.main,
-      icon: d.weather?.[0]?.icon
-    }))
+      icon: d.weather?.[0]?.icon,
+    })),
   };
 }
 

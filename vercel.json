@@ -1,5 +1,15 @@
 {
   "version": 2,
+  "builds": [
+    {
+      "src": "api/**/*.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "analytics/**",
+      "use": "@vercel/static"
+    }
+  ],
   "routes": [
     {
       "src": "/api/weather",
@@ -8,8 +18,15 @@
     {
       "src": "/api/config",
       "dest": "/api/config.js"
-    }
-    ,
+    },
+    {
+      "src": "/api/metrics",
+      "dest": "/api/metrics.js"
+    },
+    {
+      "src": "/api/notifications",
+      "dest": "/api/notifications.js"
+    },
     {
       "src": "/analytics",
       "dest": "/analytics/index.html"

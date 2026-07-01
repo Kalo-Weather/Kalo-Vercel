@@ -1,8 +1,11 @@
 {
-  "name": "kalo-vercel-proxy-sample",
+  "name": "kalo-weather-proxy",
   "version": "1.0.0",
   "private": true,
   "scripts": {
     "test": "node scripts/encrypt_and_call.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.38.0"
   }
 }
